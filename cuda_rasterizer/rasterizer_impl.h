@@ -40,6 +40,9 @@ namespace CudaRasterizer
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
+		float3* box_min; // store AABB for each point
+		float3* box_max;
+
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 

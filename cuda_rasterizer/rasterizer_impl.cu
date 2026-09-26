@@ -162,6 +162,10 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
+
+	obtain(chunk, geom.box_min, P, 128); // reserve memory for box min-maxs
+	obtain(chunk, geom.box_max, P, 128);
+
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
@@ -247,6 +251,10 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
+		
+		geomState.box_min, //
+		geomState.box_max, //
+
 		(glm::vec3*)scales,
 		scale_modifier,
 		(glm::vec4*)rotations,
@@ -326,6 +334,13 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		
+		geomState.box_min,//
+		geomState.box_max,
+		viewmatrix,
+		tan_fovx,
+		tan_fovy,
+
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,

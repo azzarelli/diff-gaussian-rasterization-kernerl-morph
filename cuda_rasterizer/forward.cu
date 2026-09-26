@@ -70,91 +70,14 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	return glm::max(result, 0.0f);
 }
 
-// Forward version of 2D covariance matrix computation
-__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
-{
-	// The following models the steps outlined by equations 29
-	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
-	// Additionally considers aspect / scaling of viewport.
-	// Transposes used to account for row-/column-major conventions.
-	float3 t = transformPoint4x3(mean, viewmatrix);
-
-	const float limx = 1.3f * tan_fovx;
-	const float limy = 1.3f * tan_fovy;
-	const float txtz = t.x / t.z;
-	const float tytz = t.y / t.z;
-	t.x = min(limx, max(-limx, txtz)) * t.z;
-	t.y = min(limy, max(-limy, tytz)) * t.z;
-
-	glm::mat3 J = glm::mat3(
-		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
-		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
-		0, 0, 0);
-
-	glm::mat3 W = glm::mat3(
-		viewmatrix[0], viewmatrix[4], viewmatrix[8],
-		viewmatrix[1], viewmatrix[5], viewmatrix[9],
-		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
-
-	glm::mat3 T = W * J;
-
-	glm::mat3 Vrk = glm::mat3(
-		cov3D[0], cov3D[1], cov3D[2],
-		cov3D[1], cov3D[3], cov3D[4],
-		cov3D[2], cov3D[4], cov3D[5]);
-
-	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
-
-	// Apply low-pass filter: every Gaussian should be at least
-	// one pixel wide/high. Discard 3rd row and column.
-	cov[0][0] += 0.3f;
-	cov[1][1] += 0.3f;
-	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
-}
-
-// Forward method for converting scale and rotation properties of each
-// Gaussian to a 3D covariance matrix in world space. Also takes care
-// of quaternion normalization.
-__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
-{
-	// Create scaling matrix
-	glm::mat3 S = glm::mat3(1.0f);
-	S[0][0] = mod * scale.x;
-	S[1][1] = mod * scale.y;
-	S[2][2] = mod * scale.z;
-
-	// Normalize quaternion to get valid rotation
-	glm::vec4 q = rot;// / glm::length(rot);
-	float r = q.x;
-	float x = q.y;
-	float y = q.z;
-	float z = q.w;
-
-	// Compute rotation matrix from quaternion
-	glm::mat3 R = glm::mat3(
-		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
-		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
-		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
-	);
-
-	glm::mat3 M = S * R;
-
-	// Compute 3D world covariance matrix Sigma
-	glm::mat3 Sigma = glm::transpose(M) * M;
-
-	// Covariance is symmetric, only store upper right
-	cov3D[0] = Sigma[0][0];
-	cov3D[1] = Sigma[0][1];
-	cov3D[2] = Sigma[0][2];
-	cov3D[3] = Sigma[1][1];
-	cov3D[4] = Sigma[1][2];
-	cov3D[5] = Sigma[2][2];
-}
-
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
+	
+	float3* box_min, // as outputs
+	float3* box_max, 
+
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
@@ -179,6 +102,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
+	// 
+	// The objective is to determine how many tiles the cube primitive touches.
+	//    We can do this using a screen-spacee radial primitive (from center to conrner with max_distance from center)
+	//    The tile asignment is already square so this works 
+	//
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
@@ -199,40 +127,39 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
-	const float* cov3D;
-	if (cov3D_precomp != nullptr)
-	{
-		cov3D = cov3D_precomp + idx * 6;
+	glm::vec3 half = scale_modifier * scales[idx];
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H)};
+	float my_radius = 0.0f;
+	bool crosses_near = false;
+
+	
+	// For each corner of the cube determine the max radius of the cube
+	for(int i=0; i<8; i++){
+		float3 corner = { // i = 000 ... 111 
+			p_orig.x + ((i & 1) ? half.x : -half.x), // if bit position 1 is "on"
+			p_orig.y + ((i & 2) ? half.y : -half.y), // if bit position 2 is "on", etc.
+			p_orig.z + ((i & 4) ? half.z : -half.z)
+		};
+
+		float4 c_hom = transformPoint4x4(corner, projmatrix);
+
+		if(c_hom.w <= 0.2f){ // Early exit for at or behind camera
+			crosses_near = true;
+			break;
+		}
+
+		float c_w = 1.0f / c_hom.w;
+		float2 c_pix = { ndc2Pix(c_hom.x * c_w, W), ndc2Pix(c_hom.y * c_w, H) };
+		my_radius = max(my_radius, max(fabsf(c_pix.x - point_image.x), fabsf(c_pix.y - point_image.y)));
 	}
-	else
-	{
-		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
-		cov3D = cov3Ds + idx * 6;
-	}
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	if(crosses_near) my_radius = W + H;
 
-	// Invert covariance (EWA algorithm)
-	float det = (cov.x * cov.z - cov.y * cov.y);
-	if (det == 0.0f)
-		return;
-	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
-
-	// Compute extent in screen space (by finding eigenvalues of
-	// 2D covariance matrix). Use extent to compute a bounding rectangle
-	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
-	float mid = 0.5f * (cov.x + cov.z);
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	my_radius = ceil(my_radius);
+	
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
@@ -250,9 +177,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	depths[idx] = p_view.z;
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
+
+	box_min[idx] = { p_orig.x - half.x - cam_pos->x, p_orig.y - half.y - cam_pos->y, p_orig.z - half.z - cam_pos->z };
+	box_max[idx] = { p_orig.x + half.x - cam_pos->x, p_orig.y + half.y - cam_pos->y, p_orig.z + half.z - cam_pos->z };
+
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	// TODO: wasteful will need to just pass opacity later
+	conic_opacity[idx] = { 0.f, 0.f, 0.f, opacities[idx] };
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // count number of tiles touched
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -267,11 +199,20 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+
+	const float3* __restrict__ box_min, //
+	const float3* __restrict__ box_max,
+	const float* __restrict__ viewmatrix,
+	float tan_fovx,
+	float tan_fovy,
+
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color)
+	// `points_xy_image` is no longer needed here.
 {
+
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -280,6 +221,24 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	// Build world-space ray
+	float2 ndc = {
+		(2.f*pixf.x + 1.f) / W-1.f,
+		(2.f*pixf.y + 1.f) / H-1.f
+	};
+	float3 d_cam = {
+		ndc.x * tan_fovx,
+		ndc.y * tan_fovy,
+		1.f
+	};
+	float3 d = transformVec4x3Transpose(d_cam, viewmatrix); // Camera to world
+	float3 inv_d = {
+		1.f / d.x,
+		1.f / d.y,
+		1.f / d.z
+	};
+
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -292,9 +251,11 @@ renderCUDA(
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ int    collected_id[BLOCK_SIZE];
+	__shared__ float3 collected_min[BLOCK_SIZE];
+	__shared__ float3 collected_max[BLOCK_SIZE];
+	__shared__ float  collected_opacity[BLOCK_SIZE];
+
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -316,8 +277,9 @@ renderCUDA(
 		{
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_min[block.thread_rank()] = box_min[coll_id];
+			collected_max[block.thread_rank()] = box_max[coll_id];
+			collected_opacity[block.thread_rank()] = conic_opacity[coll_id].w;
 		}
 		block.sync();
 
@@ -326,23 +288,27 @@ renderCUDA(
 		{
 			// Keep track of current position in range
 			contributor++;
+			
+			// SLAB test our squares
+			float3 lo = collected_min[j], hi = collected_max[j];
+			float3 t0 = { lo.x * inv_d.x, lo.y * inv_d.y, lo.z * inv_d.z };
+			float3 t1 = { hi.x * inv_d.x, hi.y * inv_d.y, hi.z * inv_d.z };
 
-			// Resample using conic matrix (cf. "Surface 
-			// Splatting" by Zwicker et al., 2001)
-			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
+			float t_near = max(
+				max(
+					min(t0.x, t1.x), min(t0.y, t1.y)
+			), min(t0.z, t1.z)); 
 
-			// Eq. (2) from 3D Gaussian splatting paper.
-			// Obtain alpha by multiplying with Gaussian opacity
-			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			float t_far = min(
+				min(
+					max(t0.x, t1.x), max(t0.y, t1.y)
+			), max(t0.z, t1.z));
+
+			if(t_far < max(t_near, 0.f)) continue; // -t_far is "behind"
+			float alpha = min(0.99f, collected_opacity[j]);
+			
+			if (alpha < 1.0f / 255.0f) continue;
+
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -381,6 +347,13 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+
+	const float3* box_min, //Call bounding box min maxs 
+	const float3* box_max,
+	const float* viewmatrix, // Required for slab intersection
+	float tan_fovx,
+	float tan_fovy,
+
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -393,6 +366,12 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
+
+		box_min, box_max, //
+		viewmatrix,
+		tan_fovx,
+		tan_fovy,
+
 		final_T,
 		n_contrib,
 		bg_color,
@@ -401,6 +380,10 @@ void FORWARD::render(
 
 void FORWARD::preprocess(int P, int D, int M,
 	const float* means3D,
+
+	float3* box_min, //
+	float3* box_max, //
+
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
@@ -425,9 +408,12 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
-	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS> <<<(P + 255) / 256, 256 >>> (
 		P, D, M,
 		means3D,
+		
+		box_min, box_max, //
+
 		scales,
 		scale_modifier,
 		rotations,

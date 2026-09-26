@@ -20,9 +20,12 @@
 
 namespace FORWARD
 {
-	// Perform initial steps for each Gaussian prior to rasterization.
 	void preprocess(int P, int D, int M,
 		const float* orig_points,
+		
+		float3* box_min, // pass the box min and maxs
+		float3* box_max,
+		
 		const glm::vec3* scales,
 		const float scale_modifier,
 		const glm::vec4* rotations,
@@ -56,6 +59,13 @@ namespace FORWARD
 		const float2* points_xy_image,
 		const float* features,
 		const float4* conic_opacity,
+		
+		const float3* box_min, //Call bounding box min maxs 
+		const float3* box_max,
+		const float* viewmatrix, // Required for slab intersection
+		float tan_fovx,
+		float tan_fovy,
+		
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
