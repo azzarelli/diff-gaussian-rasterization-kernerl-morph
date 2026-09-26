@@ -1,4 +1,4 @@
-# Differential AABB Rasterization from Gaussian Splats
+# AABB Rasterization from Gaussian Splat Input
 
 The idea is that for each Gaussian point we render an AABB kernel. The implication:
 - Cov3D dropped for tile counting and assignment. Inplace we tap the AABB vertices.
