@@ -27,8 +27,10 @@ def rasterize_gaussians(
     scales,
     rotations,
     cov3Ds_precomp,
+    time,
     raster_settings,
 ):
+    print(time)
     return _RasterizeGaussians.apply(
         means3D,
         means2D,
@@ -94,7 +96,6 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
         return color, radii
 
 class GaussianRasterizationSettings(NamedTuple):
@@ -127,7 +128,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, time=None):
         
         raster_settings = self.raster_settings
 
@@ -159,6 +160,7 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
+            time,
             raster_settings, 
         )
 
